@@ -58,7 +58,7 @@ def test_load_qkv_fused(tmp_path: Path, fake_mesh):
         params_dtype=torch.float32,
         prefix="model.layers.0.self_attn.qkv_proj",
     )
-    # q_size = 8, kv_size = 8 → fused = 24.
+    # q_size = 8, kv_size = 8 -> fused = 24.
     q = torch.full((8, 8), 1.0, dtype=torch.float32)
     k = torch.full((8, 8), 2.0, dtype=torch.float32)
     v = torch.full((8, 8), 3.0, dtype=torch.float32)
@@ -159,7 +159,7 @@ def test_remap_callable_rewrites_keys(tmp_path: Path, fake_mesh):
         {"transformer.fc.weight": src},
         str(tmp_path / "t.safetensors"),
     )
-    # Rewrite "transformer." → "model." at load time.
+    # Rewrite "transformer." -> "model." at load time.
     report = load_pretrained(
         layer,
         [tmp_path / "t.safetensors"],
@@ -404,7 +404,7 @@ def test_load_from_iterable_of_str(tmp_path: Path, fake_mesh):
 
 
 def test_load_from_empty_folder_raises(tmp_path: Path, fake_mesh):
-    """source = folder with no safetensors files → FileNotFoundError."""
+    """source = folder with no safetensors files -> FileNotFoundError."""
     fake_mesh(sizes={"tp": 1})
     _init_dispatcher()
     layer = _make_replicated()

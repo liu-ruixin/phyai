@@ -25,7 +25,7 @@ to keep the dispatch table closed.
 
 Two usage shapes
 ----------------
-The default call does the position → cos/sin lookup and the rotation
+The default call does the position -> cos/sin lookup and the rotation
 in one fused launch per layer; signature passes
 (``positions`` first, then ``q`` and ``k``):
 

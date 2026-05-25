@@ -56,10 +56,10 @@ def find_safetensors(folder: str | Path) -> list[Path]:
 
     Resolution order, mirroring HuggingFace's snapshot layout:
 
-    1. ``model.safetensors.index.json`` exists → parse its
+    1. ``model.safetensors.index.json`` exists -> parse its
        ``weight_map`` and return every distinct shard it references,
        sorted by filename.
-    2. ``model.safetensors`` exists → return ``[folder/model.safetensors]``.
+    2. ``model.safetensors`` exists -> return ``[folder/model.safetensors]``.
     3. Otherwise fall back to a glob of ``*.safetensors`` (catches
        non-canonical filenames). Raises if none are found.
 

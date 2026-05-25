@@ -88,7 +88,7 @@ def test_flashinfer_split_leaks_or_upstream_fixed():
     delta = end_smi - base_smi
 
     if delta >= 32:
-        # Leak still present → expected, document it explicitly.
+        # Leak still present -> expected, document it explicitly.
         pytest.xfail(
             f"known flashinfer leak: 5 iter split_device_green_ctx "
             f"caused {delta} MiB driver-side growth. "

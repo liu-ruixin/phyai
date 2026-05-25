@@ -115,7 +115,7 @@ def test_find_safetensors_index_no_weight_map_key_raises(tmp_path: Path):
 
 
 def test_find_safetensors_glob_fallback(tmp_path: Path):
-    """No index, no canonical name → glob picks up *.safetensors files."""
+    """No index, no canonical name -> glob picks up *.safetensors files."""
     (tmp_path / "weights-a.safetensors").write_bytes(b"")
     (tmp_path / "weights-b.safetensors").write_bytes(b"")
     out = find_safetensors(tmp_path)

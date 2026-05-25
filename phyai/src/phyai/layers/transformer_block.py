@@ -3,15 +3,15 @@
 One class for three attention flavors, chosen by the ``attn_kind``
 argument:
 
-* ``attn_kind="attention"`` (default) → :class:`Attention`. No KV
+* ``attn_kind="attention"`` (default) -> :class:`Attention`. No KV
   cache. Suitable for SigLIP-style vision encoders or any prefill-only
   path. Forward takes ``cu_seqlens_q`` / ``cu_seqlens_kv`` for ragged
   input or builds a default ctx from the q/k layout.
-* ``attn_kind="ar"`` (requires ``layer_idx: int``) → :class:`ARAttention`
+* ``attn_kind="ar"`` (requires ``layer_idx: int``) -> :class:`ARAttention`
   bound to that ``layer_id``. LM-side paged attention. Forward expects
   an ``attn_ctx`` from the runner; K/V get scattered into
   ``attn_ctx.kv_pool`` at ``attn_ctx.write_indices``.
-* ``attn_kind="diffusion"`` (requires ``layer_idx: int``) →
+* ``attn_kind="diffusion"`` (requires ``layer_idx: int``) ->
   :class:`DiffusionAttention` bound to that ``layer_id``. Action-expert
   / diffusion paged attention. Same forward shape as ``"ar"``.
 
@@ -52,7 +52,7 @@ mode              ``attn_kind`` (``"attention"`` / ``"ar"`` /
                   ``"attention"``, required for the other two)
 norm              ``norm_type`` (rmsnorm / gemma_rmsnorm / layernorm),
                   ``norm_eps``, ``norm_bias`` (LN only), ``norm_backend``,
-                  ``sandwich_norm`` (off → 2 norms; on → 4 norms)
+                  ``sandwich_norm`` (off -> 2 norms; on -> 4 norms)
 attention         ``num_heads``, ``num_kv_heads``, ``head_dim``,
                   ``attn_causal``, ``attn_sliding_window``
                   (``"attention"`` only),
@@ -107,7 +107,7 @@ RoPE patterns
   gather-and-rotate via :meth:`RotaryEmbedding.forward(positions, q, k)`.
   Argument order is ``(positions, q, k)`` to match the kernel's
   position-then-rotation contract. The flashinfer kernel does the
-  position → cos/sin lookup in-kernel.
+  position -> cos/sin lookup in-kernel.
 * **Pattern B** (``precompute_rope=True``): the caller (typically the
   stack) calls :meth:`RotaryEmbedding.compute_cos_sin(positions)` once,
   then threads the resulting ``(cos, sin)`` to every layer's forward as
@@ -288,13 +288,13 @@ class TransformerBlock(nn.Module):
 
     See module docstring for the full topology and knob list. The class
     composes existing phyai primitives:
-    :class:`QKVParallelLinear` →
-    (optional Q/K norm) →
-    (optional :class:`RotaryEmbedding`, two patterns) →
+    :class:`QKVParallelLinear` ->
+    (optional Q/K norm) ->
+    (optional :class:`RotaryEmbedding`, two patterns) ->
     :class:`Attention` (when ``attn_kind="attention"``),
     :class:`ARAttention` (when ``attn_kind="ar"``), or
-    :class:`DiffusionAttention` (when ``attn_kind="diffusion"``) →
-    :class:`RowParallelLinear` (output proj) →
+    :class:`DiffusionAttention` (when ``attn_kind="diffusion"``) ->
+    :class:`RowParallelLinear` (output proj) ->
     :class:`DenseMLP`, with norms inserted per the chosen topology.
 
     Two RoPE patterns, both branchless in :meth:`forward`:
@@ -452,7 +452,7 @@ class TransformerBlock(nn.Module):
             self.post_attn_norm = nn.Identity()
             self.post_ff_norm = nn.Identity()
 
-        # ---- Attention: QKV → (Q/K norm) → (RoPE) → attn → O ----------- #
+        # ---- Attention: QKV -> (Q/K norm) -> (RoPE) -> attn -> O ----------- #
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
             head_dim=head_dim,
@@ -504,9 +504,9 @@ class TransformerBlock(nn.Module):
         # zero ``if`` on rope configuration. ``self._rope_input_kind``
         # picks the input-validation branch in :meth:`forward`.
         #
-        # * ``rope=None``                       → passthrough (no rotation)
-        # * ``precompute_rope=False`` (default) → Pattern A: fused per-layer
-        # * ``precompute_rope=True``            → Pattern B: caller-supplied cos/sin
+        # * ``rope=None``                       -> passthrough (no rotation)
+        # * ``precompute_rope=False`` (default) -> Pattern A: fused per-layer
+        # * ``precompute_rope=True``            -> Pattern B: caller-supplied cos/sin
         if rope is None:
             self.rope = None
             self._apply_rope = self._apply_rope_passthrough

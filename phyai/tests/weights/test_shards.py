@@ -58,7 +58,7 @@ def test_sharded_replicate_gqa_share_slot(fake_mesh):
     p1 = nn.Parameter(torch.zeros(8, 4), requires_grad=False)
     sharded(dim=0, axis="tp", mesh=mesh, replicate=2)(p1, src, None)
 
-    # Ranks 0 and 1 both have rank // 2 = 0 → same slot.
+    # Ranks 0 and 1 both have rank // 2 = 0 -> same slot.
     torch.testing.assert_close(p0.data, p1.data)
 
 
@@ -94,7 +94,7 @@ def test_vocab_padding_zeros_trailing_rank(fake_mesh):
     src = torch.arange(V * D, dtype=torch.float32).reshape(V, D)
     p = nn.Parameter(torch.full((per_rank, D), 7.0), requires_grad=False)
     vocab(axis="tp", mesh=mesh)(p, src, None)
-    # Rows 96..100 from src → first 4 rows of param.
+    # Rows 96..100 from src -> first 4 rows of param.
     torch.testing.assert_close(p.data[:4], src.narrow(0, 96, 4))
     # Rest zero-filled.
     assert torch.all(p.data[4:] == 0)
@@ -106,7 +106,7 @@ def test_vocab_full_padding_rank(fake_mesh):
     V, V_padded, D = 20, 128, 2
     per_rank = V_padded // 4  # 32
     src = torch.randn(V, D)
-    # Rank 1 starts at row 32 > V=20 → all padding.
+    # Rank 1 starts at row 32 > V=20 -> all padding.
     p = nn.Parameter(torch.full((per_rank, D), 9.0), requires_grad=False)
     vocab(axis="tp", mesh=mesh)(p, src, None)
     assert torch.all(p.data == 0)

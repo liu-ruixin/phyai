@@ -356,7 +356,7 @@
         captured @ (3, 3, H, W)
       </text>
 
-      <!-- "Graph: pending" → "Graph: ✓" badge (lights at t≈6.7s) -->
+      <!-- "Graph: pending" -> "Graph: ✓" badge (lights at t≈6.7s) -->
       <g transform="translate(40, 75)">
         <rect width="168" height="22" rx="6" fill="#f4f7fb" stroke="#cfd3d8" stroke-width="1"/>
         <rect width="168" height="22" rx="6" fill="#4A90D9" opacity="0">
@@ -382,7 +382,7 @@
       </g>
 
       <text x="124" y="108" text-anchor="middle" font-size="9" fill="#4A90D9">
-        forward: pixel_values → image_embs
+        forward: pixel_values -> image_embs
       </text>
     </g>
 
@@ -430,7 +430,7 @@
       </g>
 
       <text x="124" y="108" text-anchor="middle" font-size="9" fill="#F5A65B">
-        plan_inference + forward → writes prefix K/V
+        plan_inference + forward -> writes prefix K/V
       </text>
     </g>
 
@@ -478,7 +478,7 @@
       </g>
 
       <text x="124" y="108" text-anchor="middle" font-size="9" fill="#7CB342">
-        forward × 10 (Euler) → joint K/V
+        forward × 10 (Euler) -> joint K/V
       </text>
     </g>
 
@@ -530,7 +530,7 @@
 
     <!-- ===== Arrows during step() ===== -->
 
-    <!-- LLM → KV pool prefix slab (write) -->
+    <!-- LLM -> KV pool prefix slab (write) -->
     <g opacity="0">
       <animate attributeName="opacity"
                values="0; 0; 1; 1; 0; 0"

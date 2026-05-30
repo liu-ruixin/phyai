@@ -57,6 +57,18 @@ def _canonical_backend_name(name: str) -> str:
     return name.lower().replace("_", "-")
 
 
+# flashinfer paged-prefill kernels (BatchPrefillWithPagedKVCacheWrapper).
+# Per flashinfer's own ctor docstring the accepted names are
+# auto / fa2 / fa3 / cudnn / trtllm-gen ("cute-dsl" is explicitly rejected
+# for paged KV). "auto" lets flashinfer pick. We validate against this set
+# so a typo fails at config construction rather than deep in wrapper init;
+# whether a given kernel actually supports a model's head_dim / dtype is
+# flashinfer's call at plan/run time.
+_VALID_FLASHINFER_PREFILL_BACKENDS: frozenset[str] = frozenset(
+    {"auto", "fa2", "fa3", "cudnn", "trtllm-gen"}
+)
+
+
 # ---------------------------------------------------------------------- #
 # Sub-configs                                                            #
 # ---------------------------------------------------------------------- #
@@ -294,6 +306,19 @@ class RuntimeConfig:
         head counts or long-context prefill that pushes split-k off
         the fast path. Consumed by
         :func:`phyai.layers.attention.utils.resolve_workspace_bytes`.
+    flashinfer_prefill_backend:
+        Which flashinfer prefill kernel the paged-KV attention wrappers
+        request. ``None`` (the default) defers to flashinfer's ``"auto"``
+        heuristic; otherwise one of the names
+        ``BatchPrefillWithPagedKVCacheWrapper`` accepts —
+        ``"fa2"`` / ``"fa3"`` / ``"cudnn"`` / ``"trtllm-gen"``. The right
+        choice is *shape-dependent* (e.g. the FA2 kernel beats the
+        auto-selected FA3 by ~2.5x on the pi0.5 action-expert's tiny-query
+        joint attention at head_dim 256), so this is a tunable rather than
+        a baked-in default — models that know their shape ship a
+        recommendation (see ``PI05RecommendedEngineConfig``) instead of forcing
+        it here. Consumed by
+        :func:`phyai.layers.attention.utils.resolve_prefill_backend`.
     force_linear_kernel:
         Hard override for :class:`~phyai.layers.linear.KernelDispatcher`
         — when set, every :meth:`select` returns the kernel registered
@@ -304,6 +329,7 @@ class RuntimeConfig:
 
     use_cuda_graph: bool = True
     flashinfer_workspace_bytes: int = 128 * 1024 * 1024
+    flashinfer_prefill_backend: str | None = None
     force_linear_kernel: str | None = None
 
     def __post_init__(self) -> None:
@@ -312,6 +338,14 @@ class RuntimeConfig:
             raise ValueError(
                 f"RuntimeConfig.flashinfer_workspace_bytes must be a "
                 f"positive int (bytes), got {v!r}."
+            )
+        be = self.flashinfer_prefill_backend
+        if be is not None and be not in _VALID_FLASHINFER_PREFILL_BACKENDS:
+            raise ValueError(
+                f"RuntimeConfig.flashinfer_prefill_backend={be!r} must be "
+                f"None or one of {sorted(_VALID_FLASHINFER_PREFILL_BACKENDS)} "
+                f"(the names BatchPrefillWithPagedKVCacheWrapper accepts; "
+                f"'cute-dsl' is paged-incompatible)."
             )
         # ``force_linear_kernel`` is *not* validated against the global
         # linear-kernel registry: a kernel registered into a
@@ -411,6 +445,8 @@ class EngineConfig:
             runtime_kw["use_cuda_graph"] = v
         if (v := envs.PHYAI_FLASHINFER_WORKSPACE_BYTES.get()) is not None:
             runtime_kw["flashinfer_workspace_bytes"] = v
+        if (v := envs.PHYAI_FLASHINFER_PREFILL_BACKEND.get()) is not None:
+            runtime_kw["flashinfer_prefill_backend"] = v
         if (v := envs.PHYAI_FORCE_LINEAR_KERNEL.get()) is not None:
             runtime_kw["force_linear_kernel"] = v
 

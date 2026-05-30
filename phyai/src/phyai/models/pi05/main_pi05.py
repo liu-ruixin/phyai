@@ -29,22 +29,26 @@ a second source of truth.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, ClassVar
 
 import torch
 
 from phyai.engine import Engine, Entry, EntryArgs
-from phyai.engine_config import get_engine_config
+from phyai.engine_config import get_engine_config, set_engine_config
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.modeling_pi05 import PI05Model
 from phyai.models.pi05.scheduler_ws1_pi05 import (
     PI05Request,
     PI05WS1Scheduler,
 )
-from phyai.utils import load_config
+from phyai.utils import load_config, this_rank_log
 from phyai.weights import load_pretrained
+
+
+logger = logging.getLogger(__name__)
 
 
 # Keys present in the upstream pi0.5 base safetensors that the inference
@@ -145,6 +149,14 @@ class PI05Entry(Entry):
         else:
             config = PI05Config()
 
+        # Apply pi0.5's recommended engine runtime knobs onto the singleton
+        # *before* any model / attention wrapper is built (nothing has read
+        # the workspace size or prefill backend yet — the flashinfer scratch
+        # is allocated lazily at the first wrapper construction in
+        # scheduler.setup). User / env choices always win: we only fill a
+        # value the user left at its "unset" default.
+        eng = self._apply_recommended_engine(eng, config)
+
         self.model = PI05Model(config, device=eng.device.target)
 
         if args.checkpoint_dir is not None:
@@ -162,6 +174,67 @@ class PI05Entry(Entry):
             use_cuda_graph=eng.runtime.use_cuda_graph,
         )
         self.scheduler.setup()
+
+    @staticmethod
+    def _apply_recommended_engine(eng, config: PI05Config):
+        """Overlay ``config.recommended_engine`` onto the EngineConfig singleton.
+
+        Returns the (possibly updated) :class:`EngineConfig`. Only fills
+        knobs the user left unset so an explicit ``EngineConfig`` field or
+        ``PHYAI_*`` env override always wins:
+
+        * ``flashinfer_prefill_backend``: applied only if the runtime value
+          is still ``None`` (the "defer to auto" sentinel).
+        * ``flashinfer_workspace_bytes``: applied as a *floor* (``max``)
+          and only when the effective prefill backend is ``"fa2"`` — FA2's
+          split scratch for pi0.5's expert attention needs more than the
+          128 MiB engine default.
+
+        Shipping the recommendation on the model (and injecting it here at
+        load time) keeps the shared attention backends model-agnostic
+        instead of hardcoding pi0.5's kernel choice into them.
+        """
+        rec = config.recommended_engine
+        runtime_kw: dict[str, object] = {}
+
+        if (
+            eng.runtime.flashinfer_prefill_backend is None
+            and rec.flashinfer_prefill_backend is not None
+        ):
+            runtime_kw["flashinfer_prefill_backend"] = rec.flashinfer_prefill_backend
+
+        effective_backend = runtime_kw.get(
+            "flashinfer_prefill_backend", eng.runtime.flashinfer_prefill_backend
+        )
+        if (
+            effective_backend == "fa2"
+            and eng.runtime.flashinfer_workspace_bytes < rec.flashinfer_workspace_bytes
+        ):
+            runtime_kw["flashinfer_workspace_bytes"] = rec.flashinfer_workspace_bytes
+
+        if not runtime_kw:
+            return eng
+
+        eng = replace(eng, runtime=replace(eng.runtime, **runtime_kw))
+        set_engine_config(eng)
+        ws_mib = eng.runtime.flashinfer_workspace_bytes // (1024 * 1024)
+        this_rank_log(
+            logger,
+            logging.INFO,
+            "pi0.5: applied model-recommended engine runtime %s "
+            "(prefill_backend=%s, workspace=%d MiB). Rationale: the action "
+            "expert's short-query/long-KV joint attention (head_dim 256) runs "
+            "~2.5x faster on flashinfer's FA2 kernel than the auto-selected "
+            "FA3. This is shipped as a per-model recommendation and injected "
+            "into the EngineConfig at load time — preferred over hardcoding a "
+            "model-specific kernel choice into the shared attention backends. "
+            "Override via EngineConfig(runtime=RuntimeConfig("
+            "flashinfer_prefill_backend=...)) or PHYAI_FLASHINFER_PREFILL_BACKEND.",
+            runtime_kw,
+            eng.runtime.flashinfer_prefill_backend,
+            ws_mib,
+        )
+        return eng
 
     def step(self, request: PI05Request) -> torch.Tensor:  # type: ignore[override]
         """Run one pi0.5 inference; return the action chunk ``(B, chunk, action_dim)``."""

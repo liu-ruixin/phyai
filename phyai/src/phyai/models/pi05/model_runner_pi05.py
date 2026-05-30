@@ -79,7 +79,6 @@ from phyai.models.pi05.modeling_pi05 import (
     PI05VisionTower,
 )
 from phyai.payload import (
-    ExpertForwardBatch,
     LLMForwardBatch,
     VisionForwardBatch,
 )
@@ -244,16 +243,24 @@ class PI05LLMRunner(ModelRunner):
         )
 
         self._capture_plan: ARAttnPlanHandle | None = None
-        self.graph: CudaGraph | None = None
+        # One captured graph per prefix-length bucket (keyed by
+        # ``n_per_sample``). Shorter buckets pad the lang budget to fewer
+        # tokens, so a short prompt skips the dense GEMM work on padding
+        # rows. All buckets share the single attention wrapper (re-planned
+        # per inference); ``n_per_sample`` here is the *largest* bucket and
+        # sizes the wrapper's static buffers.
+        self.graphs: dict[int, CudaGraph] = {}
 
     # ------------------------------------------------------------------ #
     # Setup                                                              #
     # ------------------------------------------------------------------ #
 
-    def setup(self) -> None:
+    def setup(self, n_per_sample_buckets: list[int] | None = None) -> None:
         all_ranks_log(logger, logging.INFO, "Entering PI05LLMRunner.setup")
         # Always allocate static buffers + build wrapper — graph mode
-        # needs them, and eager mode benefits from stable addresses.
+        # needs them, and eager mode benefits from stable addresses. They
+        # are sized for the *largest* bucket (``self.n_per_sample``);
+        # shorter buckets under-fill them.
         self.attn_backend.init_cuda_graph_state(
             max_batch_size=self.batch_size,
             max_num_tokens=self.batch_size * self.n_per_sample,
@@ -262,28 +269,43 @@ class PI05LLMRunner(ModelRunner):
             params_dtype=self.params_dtype,
             layer_proto=self.attn_proto,
         )
-        # Capture-time seed plan + graph capture.
-        if self.use_cuda_graph:
-            all_ranks_log(
-                logger,
-                logging.INFO,
-                "Entering PI05LLMRunner.setup: building capture-warmup plan and "
-                "capturing prefix-forward CUDA graph at fixed shape "
-                "(B*n_per_sample=%d, hidden_size=%d).",
-                self.batch_size * self.n_per_sample,
-                self.hidden_size,
-            )
-            self._capture_plan = self.attn_backend.init_capture_metadata(
-                self._capture_seed_metadata()
-            )
-            self._capture_graph()
+        if not self.use_cuda_graph:
+            return
 
-    def _capture_seed_metadata(self) -> ARAttnMetadata:
-        # Per-sample padded q layout — fixed across all inferences.
+        # Capture one graph per prefix-length bucket. The buckets must not
+        # exceed the max ``n_per_sample`` the buffers were sized for.
+        buckets = sorted(set(n_per_sample_buckets or [self.n_per_sample]))
+        if buckets[-1] > self.n_per_sample or buckets[0] <= 0:
+            raise ValueError(
+                f"n_per_sample buckets {buckets} must be in (0, {self.n_per_sample}]."
+            )
+        all_ranks_log(
+            logger,
+            logging.INFO,
+            "Entering PI05LLMRunner.setup: capturing %d prefix-forward CUDA "
+            "graph(s) at B*n_per_sample in %s (hidden_size=%d).",
+            len(buckets),
+            [self.batch_size * n for n in buckets],
+            self.hidden_size,
+        )
+        # Seed the (shared) wrapper plan handle once, then re-plan it per
+        # bucket right before capturing that bucket's graph.
+        self._capture_plan = self.attn_backend.init_capture_metadata(
+            self._capture_seed_metadata(self.n_per_sample)
+        )
+        for n_ps in buckets:
+            self.attn_backend.replay_metadata(
+                self._capture_plan, self._capture_seed_metadata(n_ps)
+            )
+            self.graphs[n_ps] = self._capture_graph(n_ps)
+
+    def _capture_seed_metadata(self, n_per_sample: int) -> ARAttnMetadata:
+        # Per-sample padded q layout for this bucket — fixed across all
+        # inferences that route to it.
         cu_q = torch.arange(
             0,
-            (self.batch_size + 1) * self.n_per_sample,
-            self.n_per_sample,
+            (self.batch_size + 1) * n_per_sample,
+            n_per_sample,
             dtype=torch.int32,
             device=self.device,
         )
@@ -291,7 +313,7 @@ class PI05LLMRunner(ModelRunner):
         # sample contributes ``min(n_per_sample, max_indices/B)`` real
         # tokens. Real values arrive at the first ``plan_inference`` call.
         per_sample_real = min(
-            self.n_per_sample, self.max_paged_kv_indices // self.batch_size
+            n_per_sample, self.max_paged_kv_indices // self.batch_size
         )
         kv_indptr = torch.arange(
             0,
@@ -307,7 +329,7 @@ class PI05LLMRunner(ModelRunner):
         )
         last_page = torch.ones(self.batch_size, dtype=torch.int32, device=self.device)
         write_indices = torch.zeros(
-            self.batch_size * self.n_per_sample,
+            self.batch_size * n_per_sample,
             dtype=torch.int64,
             device=self.device,
         )
@@ -315,7 +337,7 @@ class PI05LLMRunner(ModelRunner):
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=self.batch_size,
-            num_query_tokens=self.batch_size * self.n_per_sample,
+            num_query_tokens=self.batch_size * n_per_sample,
             cu_seqlens_q=cu_q,
             paged_kv_indptr=kv_indptr,
             paged_kv_indices=kv_indices,
@@ -323,8 +345,8 @@ class PI05LLMRunner(ModelRunner):
             write_indices=write_indices,
         )
 
-    def _capture_graph(self) -> None:
-        n = self.batch_size * self.n_per_sample
+    def _capture_graph(self, n_per_sample: int) -> CudaGraph:
+        n = self.batch_size * n_per_sample
         example = {
             "hidden_states": torch.zeros(
                 n, self.hidden_size, dtype=self.params_dtype, device=self.device
@@ -332,8 +354,9 @@ class PI05LLMRunner(ModelRunner):
             "position_ids": torch.zeros(n, dtype=torch.int32, device=self.device),
             "write_indices": torch.zeros(n, dtype=torch.int64, device=self.device),
         }
-        self.graph = CudaGraph()
-        self.graph.capture(self._fwd, example)
+        graph = CudaGraph()
+        graph.capture(self._fwd, example)
+        return graph
 
     # ------------------------------------------------------------------ #
     # Forward path                                                       #
@@ -369,9 +392,24 @@ class PI05LLMRunner(ModelRunner):
         else:
             self._capture_plan = self.attn_backend.init_forward_metadata(meta)
 
-    def forward(self, batch: LLMForwardBatch) -> None:
-        if self.graph is not None:
-            self.graph.replay(
+    def forward(
+        self, batch: LLMForwardBatch, *, n_per_sample: int | None = None
+    ) -> None:
+        """Run the prefix forward for the given prefix-length bucket.
+
+        ``n_per_sample`` selects which captured graph to replay (the
+        scheduler builds ``batch`` at that bucket's length). ``None`` uses
+        the largest bucket. Ignored on the eager fallback.
+        """
+        if self.use_cuda_graph and self.graphs:
+            n_ps = n_per_sample if n_per_sample is not None else self.n_per_sample
+            graph = self.graphs.get(n_ps)
+            if graph is None:
+                raise ValueError(
+                    f"no captured LLM graph for n_per_sample={n_ps}; "
+                    f"captured buckets: {sorted(self.graphs)}."
+                )
+            graph.replay(
                 {
                     "hidden_states": batch.hidden_states,
                     "position_ids": batch.position_ids,
@@ -394,16 +432,19 @@ class PI05LLMRunner(ModelRunner):
 
 
 class PI05ExpertRunner(ModelRunner):
-    """One Euler denoise step: ``embed_action -> 18 expert layers -> project_action``.
+    """The full flow-matching Euler loop captured as one CUDA graph.
 
-    Captured at fixed shape ``(B, chunk_size, max_action_dim)`` for
-    ``x_t`` and ``(B, expert_hidden)`` for the precomputed
-    ``time_emb`` (already through the full time MLP — the scheduler
-    builds a per-step lookup table once at :meth:`setup` and copies the
-    right row in per Euler step). Within one inference all
-    Euler steps share the same cache layout — :meth:`plan_inference`
-    refreshes the wrapper buffers once and :meth:`forward` is replayed
-    ``num_inference_steps`` times.
+    :meth:`forward` takes the initial ``noise`` ``(B, chunk_size,
+    max_action_dim)`` and runs all ``num_steps`` denoise steps
+    (``embed_action -> 18 expert layers -> project_action`` then
+    ``x_t <- x_t + dt * v_t``) internally, returning the final ``x_t``.
+    The per-step conditioning is read in-graph from the constant
+    ``time_emb_table`` bound via :meth:`bind_euler_schedule` (the
+    scheduler precomputes it from the time MLP). Unrolling the loop into
+    a single graph removes the N-1 extra graph launches and the eager
+    between-step update; within one inference all steps share the same
+    cache layout, so :meth:`plan_inference` refreshes the wrapper buffers
+    once before the (single) replay.
 
     Two runner-owned static tensors on top of the backend's own static
     state:
@@ -414,7 +455,7 @@ class PI05ExpertRunner(ModelRunner):
       bound once at scheduler setup via :meth:`set_write_indices`.
 
     Both are baked into the captured graph by Python identity (read
-    off ``self`` inside :meth:`_fwd`), so they stay outside the
+    off ``self`` inside :meth:`_one_step`), so they stay outside the
     backend's :meth:`replay_metadata` contract.
     """
 
@@ -482,6 +523,15 @@ class PI05ExpertRunner(ModelRunner):
         self._capture_plan: DiffusionAttnPlanHandle | None = None
         self.graph: CudaGraph | None = None
 
+        # Euler schedule, bound by the scheduler via ``bind_euler_schedule``
+        # *before* ``setup()``. The captured graph unrolls all
+        # ``num_steps`` denoise steps internally and reads
+        # ``time_emb_table[step]`` in-graph (a constant lookup), so the
+        # whole flow-matching loop is one replay instead of N.
+        self._time_emb_table: torch.Tensor | None = None
+        self._dt: float = 0.0
+        self._num_steps: int = 0
+
     def set_write_indices(self, write_indices_suffix: torch.Tensor) -> None:
         """Bind the suffix-slab slot indices once at scheduler setup."""
         if write_indices_suffix.shape != self.write_indices_suffix_buf.shape:
@@ -491,12 +541,38 @@ class PI05ExpertRunner(ModelRunner):
             )
         self.write_indices_suffix_buf.copy_(write_indices_suffix.to(torch.int64))
 
+    def bind_euler_schedule(
+        self, time_emb_table: torch.Tensor, *, dt: float, num_steps: int
+    ) -> None:
+        """Bind the flow-matching Euler schedule (call before :meth:`setup`).
+
+        ``time_emb_table`` is the ``(num_steps, expert_hidden)`` constant
+        lookup the scheduler precomputes from the time MLP; row ``step``
+        is the AdaRMS conditioning for that Euler step. ``dt`` is the
+        (constant) step size. The captured graph reads these in-graph, so
+        they must be bound before the graph is captured.
+        """
+        if time_emb_table.shape[0] != num_steps:
+            raise ValueError(
+                f"time_emb_table has {time_emb_table.shape[0]} rows but "
+                f"num_steps={num_steps}."
+            )
+        self._time_emb_table = time_emb_table
+        self._dt = float(dt)
+        self._num_steps = int(num_steps)
+
     # ------------------------------------------------------------------ #
     # Setup                                                              #
     # ------------------------------------------------------------------ #
 
     def setup(self) -> None:
         all_ranks_log(logger, logging.INFO, "Entering PI05ExpertRunner.setup")
+        if self._time_emb_table is None or self._num_steps <= 0:
+            raise RuntimeError(
+                "PI05ExpertRunner.setup() called before bind_euler_schedule(); "
+                "the captured graph unrolls the Euler loop and needs the "
+                "time-embedding table and step count."
+            )
         self.attn_backend.init_cuda_graph_state(
             max_batch_size=self.batch_size,
             max_num_tokens=self.batch_size * self.chunk_size,
@@ -509,8 +585,10 @@ class PI05ExpertRunner(ModelRunner):
             all_ranks_log(
                 logger,
                 logging.INFO,
-                "Entering PI05ExpertRunner.setup: capturing expert-forward CUDA "
-                "graph at fixed shape (B=%d, chunk_size=%d, max_action_dim=%d).",
+                "Entering PI05ExpertRunner.setup: capturing the full %d-step "
+                "Euler loop as one CUDA graph at fixed shape "
+                "(B=%d, chunk_size=%d, max_action_dim=%d).",
+                self._num_steps,
                 self.batch_size,
                 self.chunk_size,
                 self.max_action_dim,
@@ -561,34 +639,27 @@ class PI05ExpertRunner(ModelRunner):
 
     def _capture_graph(self) -> None:
         example = {
-            "x_t": torch.zeros(
+            "noise": torch.zeros(
                 self.batch_size,
                 self.chunk_size,
                 self.max_action_dim,
                 dtype=self.params_dtype,
                 device=self.device,
             ),
-            "time_emb": torch.zeros(
-                self.batch_size,
-                self.expert_hidden,
-                dtype=self.params_dtype,
-                device=self.device,
-            ),
         }
         self.graph = CudaGraph()
-        self.graph.capture(self._fwd, example)
+        self.graph.capture(self._fwd_loop, example)
 
     # ------------------------------------------------------------------ #
     # Forward path                                                       #
     # ------------------------------------------------------------------ #
 
-    def _fwd(
+    def _one_step(
         self,
-        *,
         x_t: torch.Tensor,
         time_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """One Euler denoise step (see class docstring)."""
+        """One Euler denoise step: ``embed_action -> 18 layers -> project``."""
         action_emb = self.heads.embed_action(x_t)
         suffix_h = action_emb.reshape(self.batch_size * self.chunk_size, -1)
         cond_per_token = time_emb.repeat_interleave(self.chunk_size, dim=0)
@@ -610,8 +681,26 @@ class PI05ExpertRunner(ModelRunner):
         suffix_out_3d = suffix_out.view(self.batch_size, self.chunk_size, -1)
         return self.heads.project_action(suffix_out_3d)
 
+    def _fwd_loop(self, *, noise: torch.Tensor) -> torch.Tensor:
+        """Run the full ``num_steps``-step Euler loop, returning final ``x_t``.
+
+        Unrolled at a constant ``num_steps`` so it captures into one CUDA
+        graph. Each step reads its conditioning from the constant
+        ``time_emb_table`` (a static in-graph lookup) and applies the
+        flow-matching update ``x_t <- x_t + dt * v_t`` — bit-identical to
+        the old scheduler-driven loop, just without the per-step graph
+        launch and the eager between-step update.
+        """
+        assert self._time_emb_table is not None  # bound in setup()
+        x_t = noise
+        for step in range(self._num_steps):
+            time_emb = self._time_emb_table[step : step + 1].expand(self.batch_size, -1)
+            v_t = self._one_step(x_t, time_emb)
+            x_t = x_t + self._dt * v_t.to(x_t.dtype)
+        return x_t
+
     def plan_inference(self, meta: DiffusionAttnMetadata) -> None:
-        """Refresh metadata for one inference (10 Euler steps share it).
+        """Refresh metadata for one inference (all Euler steps share it).
 
         ``pos_ids_suffix`` is updated from ``meta.position_ids``;
         ``cu_q`` and ``write_indices_suffix`` are constants and stay on
@@ -627,10 +716,16 @@ class PI05ExpertRunner(ModelRunner):
         else:
             self._capture_plan = self.attn_backend.init_forward_metadata(meta)
 
-    def forward(self, batch: ExpertForwardBatch) -> torch.Tensor:
+    def forward(self, noise: torch.Tensor) -> torch.Tensor:
+        """Run the whole Euler loop from ``noise``; return final ``x_t``.
+
+        The returned tensor aliases the captured graph's static output
+        buffer (refilled every replay) — clone it if it must outlive the
+        next call.
+        """
         if self.graph is not None:
-            return self.graph.replay({"x_t": batch.x_t, "time_emb": batch.time_emb})
-        return self._fwd(x_t=batch.x_t, time_emb=batch.time_emb)
+            return self.graph.replay({"noise": noise})
+        return self._fwd_loop(noise=noise)
 
 
 __all__ = [

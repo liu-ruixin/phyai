@@ -946,11 +946,14 @@ class PI05ExpertLayer(nn.Module):
         attn_out = self.attn(q, k, v, attn_ctx)
         attn_flat = attn_out.reshape(*attn_out.shape[:-2], -1)
         out, _ = self.o_proj(attn_flat)
-        h = residual + out * gate_attn
+        # ``residual + out * gate`` as one fused-multiply-add kernel (saves a
+        # separate mul + add per gated residual; FMA rounds once instead of
+        # twice, so it matches the old two-op form to bf16 ulp).
+        h = torch.addcmul(residual, out, gate_attn)
         residual = h
         m, gate_mlp = self.post_attention_layernorm(h, cond)
         m = self.mlp(m)
-        return residual + m * gate_mlp
+        return torch.addcmul(residual, m, gate_mlp)
 
 
 class PI05ExpertStack(nn.Module):

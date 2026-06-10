@@ -79,3 +79,4 @@ All coding agents working in this repo should keep a concise work log under `.me
 - Update the memory file as work progresses, especially before handing off, pausing, or finishing.
 - Other agents should read relevant `.memory/` notes before continuing related work.
 - If user want to add documents, pls use mintlify skills set. It those skills are not installed. pls use `npx skills add https://mintlify.com/docs` to install it first.
+- After all your work(including modify files), you should check there is no personal directory path in the code. There are no code that will show someones' PC hardware information. Attach personal information in the public repo code is dangerous.

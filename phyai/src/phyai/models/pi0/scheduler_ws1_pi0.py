@@ -226,7 +226,7 @@ class PI0WS1Scheduler(Scheduler):
         self.vision_runner = PI0VisionRunner(
             model.vision,
             num_images=self.num_images,
-            params_dtype=self.params_dtype,
+            params_dtype=model.vision_params_dtype,
             device=self.device,
             use_cuda_graph=use_cuda_graph,
         )
@@ -304,7 +304,9 @@ class PI0WS1Scheduler(Scheduler):
         n_real_total = int(real_lens.sum())
 
         with event_scope("pi0.vision_loop"):
-            pixel_values = request.pixel_values.to(device=device, dtype=dtype)
+            pixel_values = request.pixel_values.to(
+                device=device, dtype=self.model.vision_params_dtype
+            )
             image_embs: torch.Tensor | None = None
             for b in range(actual_B):
                 vision_out = self.vision_runner.forward(

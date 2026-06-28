@@ -292,11 +292,11 @@ class PI0Processor(BaseModelProcessor):
 
         save_dir = Path(save_directory)
         pre_core = ProcessorPipeline(
-            steps=[s for s in self._preprocessor.steps if not _is_vision_glue(s)],
+            steps=[s for s in self.preprocessor.steps if not _is_vision_glue(s)],
             name="policy_preprocessor",
         )
         post_core = ProcessorPipeline(
-            steps=list(self._postprocessor.steps),
+            steps=list(self.postprocessor.steps),
             name="policy_postprocessor",
         )
         pre_core.save_pretrained(save_dir, config_filename=PRE_CONFIG_FILENAME)

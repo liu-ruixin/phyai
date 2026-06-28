@@ -162,6 +162,7 @@ class PositionEmbedding(nn.Module):
             torch.empty(num_embeddings, embedding_dim, dtype=dtype, device=device),
             requires_grad=False,
         )
+        nn.init.normal_(self.weight, std=0.02)
         if prefix:
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
             self.weight.weight_loader = replicated()

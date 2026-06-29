@@ -14,7 +14,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from phyai.layers.linear.backend import Granularity, KernelProbe
-from phyai.layers.linear.backends.torch import TorchKernel, _expand_block_scale, _unpack_e2m1
+from phyai.layers.linear.backends.torch import (
+    TorchKernel,
+    _expand_block_scale,
+    _unpack_e2m1,
+)
 from phyai.layers.linear.spec import Bf16Spec, Fp8Spec, Nvfp4Spec
 from phyai.layers.quant import AllocationRequest
 from phyai.parallel.state import Mode

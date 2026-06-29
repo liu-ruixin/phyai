@@ -522,7 +522,16 @@ def test_init_force_env_overrides(fake_mesh, monkeypatch):
         (86, ["bf16"]),  # Ampere A10/A40 — the reported failure
         (89, ["bf16", "fp8_per_tensor", "fp8_per_channel"]),  # Ada
         (90, ["bf16", "fp8_per_tensor", "fp8_per_channel"]),  # Hopper
-        (100,["bf16", "fp8_per_tensor", "fp8_per_channel", "fp8_block_128_128", "nvfp4_block_16_128x4",]),
+        (
+            100,
+            [
+                "bf16",
+                "fp8_per_tensor",
+                "fp8_per_channel",
+                "fp8_block_128_128",
+                "nvfp4_block_16_128x4",
+            ],
+        ),
     ],
 )
 def test_supported_specs_for_sm(sm, expected):

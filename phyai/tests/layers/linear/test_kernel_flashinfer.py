@@ -40,6 +40,7 @@ def _probe(spec_id: str, *, M=16, N=128, K=128, sm=100) -> KernelProbe:
         mode=Mode.EAGER,
     )
 
+
 def _build_layer(spec, N, K, device, weight):
     layer = torch.nn.Module()
     layer.spec = spec
@@ -81,12 +82,12 @@ def test_flashinfer_numeric_accuracy():
     weight = torch.randn((N, K), dtype=torch.bfloat16, device="cuda")
     x = torch.randn((1, K), dtype=torch.bfloat16, device="cuda")
     y_bf16 = F.linear(x, weight)
-    
+
     spec = Nvfp4Spec(scale_layout="128x4")
     layer = _build_layer(spec, N, K, "cuda", weight)
 
     y_flashinfer = k.apply(layer, x, None)
-    
+
     bf16_rel_err = (
         y_flashinfer.float() - y_bf16.float()
     ).norm() / y_bf16.float().norm().clamp_min(1e-8)
@@ -94,6 +95,7 @@ def test_flashinfer_numeric_accuracy():
         f"FlashInfer NVFP4 end-to-end relative error {bf16_rel_err:.4f} "
         "against bf16 reference exceeds 15%"
     )
+
 
 def test_flashinfer_numeric_accuracy_with_bias():
     if _sm() < 100:
@@ -106,12 +108,12 @@ def test_flashinfer_numeric_accuracy_with_bias():
     bias = torch.randn((N,), dtype=torch.bfloat16, device="cuda")
     x = torch.randn((1, K), dtype=torch.bfloat16, device="cuda")
     y_bf16 = F.linear(x, weight, bias)
-    
+
     spec = Nvfp4Spec(scale_layout="128x4")
     layer = _build_layer(spec, N, K, "cuda", weight)
 
     y_flashinfer = k.apply(layer, x, bias)
-    
+
     bf16_rel_err = (
         y_flashinfer.float() - y_bf16.float()
     ).norm() / y_bf16.float().norm().clamp_min(1e-8)

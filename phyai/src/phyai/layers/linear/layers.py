@@ -96,13 +96,11 @@ class LinearBase(nn.Module):
     def _attach_weight_loader(layer: nn.Module, loader) -> None:
         load_weight = getattr(layer.spec, "load_weight", None)
         if callable(load_weight):
-            layer.weight.weight_loader = (
-                lambda _param, loaded, shard_id: load_weight(
-                    layer,
-                    loaded,
-                    shard_id,
-                    loader,
-                )
+            layer.weight.weight_loader = lambda _param, loaded, shard_id: load_weight(
+                layer,
+                loaded,
+                shard_id,
+                loader,
             )
         else:
             layer.weight.weight_loader = loader

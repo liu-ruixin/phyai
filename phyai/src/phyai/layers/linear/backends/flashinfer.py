@@ -171,9 +171,9 @@ class FlashInferKernel:
         assert _FiSfLayout is not None
         K = x.shape[-1]
         x_2d = x.reshape(-1, K)
-        x_global_scale = (448.0 * 6.0) / x_2d.float().abs().nan_to_num().max().clamp_min(
-            1e-12
-        )
+        x_global_scale = (
+            448.0 * 6.0
+        ) / x_2d.float().abs().nan_to_num().max().clamp_min(1e-12)
         x_global_scale = x_global_scale.reshape(1).to(torch.float32)
         act_x, act_scale = _fi_nvfp4_quantize(
             x_2d,

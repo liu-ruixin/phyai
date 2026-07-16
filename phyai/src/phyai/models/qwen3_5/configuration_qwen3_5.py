@@ -53,10 +53,22 @@ class Qwen3_5TextConfig(PretrainedConfig):
     """Config for the Qwen3.5 hybrid text decoder."""
 
     nested_sources = {
-        "mrope_section": "rope_parameters.mrope_section",
-        "partial_rotary_factor": "rope_parameters.partial_rotary_factor",
-        "rope_theta": "rope_parameters.rope_theta",
-        "rope_type": "rope_parameters.rope_type",
+        "mrope_section": (
+            "rope_parameters.mrope_section",
+            "rope_scaling.mrope_section",
+        ),
+        "partial_rotary_factor": (
+            "rope_parameters.partial_rotary_factor",
+            "rope_scaling.partial_rotary_factor",
+        ),
+        "rope_theta": (
+            "rope_parameters.rope_theta",
+            "rope_scaling.rope_theta",
+        ),
+        "rope_type": (
+            "rope_parameters.rope_type",
+            "rope_scaling.rope_type",
+        ),
     }
 
     vocab_size: int = 248320

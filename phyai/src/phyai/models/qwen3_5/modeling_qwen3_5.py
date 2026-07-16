@@ -33,6 +33,24 @@ if TYPE_CHECKING:
     from phyai.layers.attention import ARAttnCtx, GatedDeltaNetCtx
 
 
+def _prepare_prefill_attention_mask(
+    attention_mask: torch.Tensor | None, input_shape: torch.Size
+) -> None:
+    if attention_mask is None:
+        return None
+    if attention_mask.shape != input_shape:
+        raise ValueError(
+            f"attention_mask must have shape {tuple(input_shape)}, got "
+            f"{tuple(attention_mask.shape)}."
+        )
+    if not bool(attention_mask.bool().all()):
+        raise NotImplementedError(
+            "Qwen3.5 prefill does not support padding because full-attention "
+            "layers require a padding-aware attention context."
+        )
+    return None
+
+
 def qwen3_5_weight_remap(name: str) -> str | None:
     """Drop checkpoint components that are outside the main prefill graph."""
     if name.startswith("mtp."):
@@ -608,6 +626,8 @@ class Qwen3_5TextModel(nn.Module):
         attn_ctx: "ARAttnCtx | None" = None,
         gdn_ctxs: list["GatedDeltaNetCtx | None"] | None = None,
     ) -> torch.Tensor:
+        _prepare_prefill_attention_mask(attention_mask, inputs_embeds.shape[:2])
+        attention_mask = None
         cos, sin = self.get_position_embeddings(inputs_embeds, position_ids)
         hidden_states = inputs_embeds
         for layer_idx, layer in enumerate(self.layers):
@@ -932,11 +952,17 @@ class Qwen3_5VisionModel(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
     ) -> torch.Tensor:
+        grid_thw = grid_thw.to(device="cpu")
         indices, weights = get_vision_bilinear_indices_and_weights(
             grid_thw, self.num_grid_per_side, self.spatial_merge_size
         )
         position_ids = get_vision_position_ids(grid_thw, self.spatial_merge_size)
         cu_seqlens = get_vision_cu_seqlens(grid_thw)
+        device = self.pos_embed_weight.device
+        indices = indices.to(device=device)
+        weights = weights.to(device=device, dtype=self.pos_embed_weight.dtype)
+        position_ids = position_ids.to(device=device)
+        cu_seqlens = cu_seqlens.to(device=device)
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = (self.pos_embed_weight[indices] * weights[..., None]).sum(0)
         hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
@@ -993,15 +1019,20 @@ class Qwen3_5Model(nn.Module):
     @staticmethod
     def get_vision_position_ids(
         start_position: int,
-        grid_thw: torch.Tensor,
+        grid_thw: torch.Tensor | list[int] | tuple[int, ...],
         spatial_merge_size: int,
+        device: torch.device | str | None = None,
     ) -> torch.Tensor:
+        if isinstance(grid_thw, torch.Tensor):
+            if device is None:
+                device = grid_thw.device
+            grid_thw = grid_thw.tolist()
         t, h, w = (int(x) for x in grid_thw)
         h //= spatial_merge_size
         w //= spatial_merge_size
-        temporal = torch.arange(t, device=grid_thw.device).repeat_interleave(h * w)
-        height = torch.arange(h, device=grid_thw.device).repeat_interleave(w).repeat(t)
-        width = torch.arange(w, device=grid_thw.device).repeat(h * t)
+        temporal = torch.arange(t, device=device).repeat_interleave(h * w)
+        height = torch.arange(h, device=device).repeat_interleave(w).repeat(t)
+        width = torch.arange(w, device=device).repeat(h * t)
         return torch.stack((temporal, height, width)) + start_position
 
     def get_rope_index(
@@ -1013,14 +1044,15 @@ class Qwen3_5Model(nn.Module):
         video_grid_thw: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        image_grids = None if image_grid_thw is None else image_grid_thw.tolist()
+        video_grids = None
         if video_grid_thw is not None:
-            video_grid_thw = torch.repeat_interleave(
-                video_grid_thw, video_grid_thw[:, 0], dim=0
-            ).clone()
-            video_grid_thw[:, 0] = 1
+            video_grids = []
+            for t, h, w in video_grid_thw.tolist():
+                video_grids.extend([(1, h, w)] * int(t))
         grid_iters = {
-            1: iter(image_grid_thw) if image_grid_thw is not None else None,
-            2: iter(video_grid_thw) if video_grid_thw is not None else None,
+            1: iter(image_grids) if image_grids is not None else None,
+            2: iter(video_grids) if video_grids is not None else None,
         }
         position_ids = torch.zeros(
             3,
@@ -1028,13 +1060,17 @@ class Qwen3_5Model(nn.Module):
             dtype=input_ids.dtype,
             device=input_ids.device,
         )
-        for batch_idx, token_types in enumerate(mm_token_type_ids):
+        token_type_rows = mm_token_type_ids.to(device="cpu").tolist()
+        for batch_idx, token_types in enumerate(token_type_rows):
             mask = None if attention_mask is None else attention_mask[batch_idx].bool()
             if mask is not None:
-                token_types = token_types[mask]
+                mask_values = mask.to(device="cpu").tolist()
+                token_types = [
+                    kind for kind, keep in zip(token_types, mask_values) if keep
+                ]
             groups = []
             for kind, group in itertools.groupby(
-                enumerate(token_types.tolist()), lambda item: item[1]
+                enumerate(token_types), lambda item: item[1]
             ):
                 group = list(group)
                 groups.append((kind, group[0][0], group[-1][0] + 1))
@@ -1047,12 +1083,23 @@ class Qwen3_5Model(nn.Module):
                     parts.append(part.view(1, -1).expand(3, -1) + current_position)
                     current_position += length
                 else:
-                    grid = next(grid_iters[kind])
+                    grid_iter = grid_iters.get(kind)
+                    if grid_iter is None:
+                        raise ValueError(
+                            f"Missing grid metadata for token type {kind}."
+                        )
+                    try:
+                        grid = next(grid_iter)
+                    except StopIteration as error:
+                        raise ValueError(
+                            f"Not enough grid entries for token type {kind}."
+                        ) from error
                     parts.append(
                         self.get_vision_position_ids(
                             current_position,
                             grid,
                             self.config.vision.spatial_merge_size,
+                            device=input_ids.device,
                         )
                     )
                     current_position += (
@@ -1064,7 +1111,120 @@ class Qwen3_5Model(nn.Module):
                 position_ids[:, batch_idx] = positions
             else:
                 position_ids[:, batch_idx, mask] = positions
+        for kind, grid_iter in grid_iters.items():
+            if grid_iter is None:
+                continue
+            try:
+                next(grid_iter)
+            except StopIteration:
+                continue
+            raise ValueError(f"Unused grid entries for token type {kind}.")
         return position_ids
+
+    def _validate_multimodal_inputs(
+        self,
+        input_ids: torch.Tensor,
+        mm_token_type_ids: torch.Tensor | None,
+        *,
+        pixel_values: torch.Tensor | None,
+        pixel_values_videos: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+        video_grid_thw: torch.Tensor | None,
+    ) -> None:
+        modalities = (
+            (
+                "image",
+                1,
+                pixel_values,
+                image_grid_thw,
+            ),
+            (
+                "video",
+                2,
+                pixel_values_videos,
+                video_grid_thw,
+            ),
+        )
+        for name, _, pixels, grid in modalities:
+            if (pixels is None) != (grid is None):
+                raise ValueError(
+                    f"{name} pixels and {name}_grid_thw must be provided together."
+                )
+
+        if mm_token_type_ids is not None and mm_token_type_ids.shape != input_ids.shape:
+            raise ValueError(
+                f"mm_token_type_ids must have shape {tuple(input_ids.shape)}, got "
+                f"{tuple(mm_token_type_ids.shape)}."
+            )
+
+        input_rows = input_ids.to(device="cpu").tolist()
+        expected_type_rows = [
+            [
+                1
+                if token == self.config.image_token_id
+                else 2
+                if token == self.config.video_token_id
+                else 0
+                for token in row
+            ]
+            for row in input_rows
+        ]
+        if mm_token_type_ids is not None:
+            type_rows = mm_token_type_ids.to(device="cpu").tolist()
+            if type_rows != expected_type_rows:
+                raise ValueError(
+                    "mm_token_type_ids must match image and video token placeholders."
+                )
+
+        group_lengths: dict[int, list[int]] = {1: [], 2: []}
+        for type_row in expected_type_rows:
+            for kind, group in itertools.groupby(type_row):
+                length = sum(1 for _ in group)
+                if kind in group_lengths:
+                    group_lengths[kind].append(length)
+
+        merge = self.config.vision.spatial_merge_size
+        patch_elements = (
+            self.config.vision.in_channels
+            * self.config.vision.temporal_patch_size
+            * self.config.vision.patch_size**2
+        )
+        for name, kind, pixels, grid in modalities:
+            expected_lengths: list[int] = []
+            expected_patches = 0
+            if grid is not None:
+                if grid.ndim != 2 or grid.shape[1] != 3:
+                    raise ValueError(
+                        f"{name}_grid_thw must have shape (N, 3), got "
+                        f"{tuple(grid.shape)}."
+                    )
+                for t, h, w in grid.tolist():
+                    t, h, w = int(t), int(h), int(w)
+                    if min(t, h, w) <= 0:
+                        raise ValueError(f"{name}_grid_thw values must be positive.")
+                    if h % merge or w % merge:
+                        raise ValueError(
+                            f"{name}_grid_thw spatial dimensions must be divisible "
+                            f"by spatial_merge_size={merge}."
+                        )
+                    expected_patches += t * h * w
+                    merged_spatial = (h // merge) * (w // merge)
+                    if kind == 2:
+                        expected_lengths.extend([merged_spatial] * t)
+                    else:
+                        expected_lengths.append(t * merged_spatial)
+            if (
+                pixels is not None
+                and pixels.numel() != expected_patches * patch_elements
+            ):
+                raise ValueError(
+                    f"{name} pixels contain the wrong number of patch elements for "
+                    f"{name}_grid_thw."
+                )
+            if group_lengths[kind] != expected_lengths:
+                raise ValueError(
+                    f"{name} token placeholder groups do not match {name}_grid_thw."
+                )
 
     def forward(
         self,
@@ -1080,6 +1240,30 @@ class Qwen3_5Model(nn.Module):
         attn_ctx: "ARAttnCtx | None" = None,
         gdn_ctxs: list["GatedDeltaNetCtx | None"] | None = None,
     ) -> torch.Tensor:
+        _prepare_prefill_attention_mask(attention_mask, input_ids.shape)
+        attention_mask = None
+        if image_grid_thw is not None:
+            image_grid_thw = image_grid_thw.to(device="cpu")
+        if video_grid_thw is not None:
+            video_grid_thw = video_grid_thw.to(device="cpu")
+        has_multimodal = any(
+            value is not None
+            for value in (
+                pixel_values,
+                pixel_values_videos,
+                image_grid_thw,
+                video_grid_thw,
+            )
+        )
+        if has_multimodal:
+            self._validate_multimodal_inputs(
+                input_ids,
+                mm_token_type_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+            )
         inputs_embeds = self.language_model.embed_tokens(input_ids)
         for pixel_data, grid, token_id in (
             (pixel_values, image_grid_thw, self.config.image_token_id),
@@ -1096,7 +1280,6 @@ class Qwen3_5Model(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(
                 token_mask, features.to(inputs_embeds.dtype)
             )
-        has_multimodal = image_grid_thw is not None or video_grid_thw is not None
         if position_ids is None and has_multimodal:
             if mm_token_type_ids is None:
                 raise ValueError(

@@ -68,6 +68,7 @@ class MiniCPMGR00TArgs(EntryArgs):
     weight_remap: Callable[[str], str | None] | dict[str, str] | None = None
     weight_strict: bool = True
     gdn_backend: str = "fla"
+    norm_backend: str = "phyai-kernel"
 
 
 @Engine.register
@@ -89,6 +90,7 @@ class MiniCPMGR00TEntry(Entry):
             vlm_params_dtype=torch.bfloat16,
             action_params_dtype=torch.float32,
             gdn_backend=args.gdn_backend,
+            norm_backend=args.norm_backend,
             device=engine.device.target,
         )
         if args.checkpoint is not None:

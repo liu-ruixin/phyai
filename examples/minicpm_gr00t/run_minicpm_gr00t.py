@@ -1,5 +1,11 @@
 """Run MiniCPM-GR00T end-to-end from an original PTH checkpoint.
 
+Demonstrates the full flow: a
+``phyai_utils_tools.models.minicpm_gr00t.MiniCPMGR00TProcessor`` turns two raw
+camera frames + a task instruction + an 80-D state into the canonical
+``MiniCPMGR00TRequest`` tensors, the engine runs, and the processor's
+``postprocess`` returns the CPU float32 action chunk.
+
 Example::
 
     uv run python examples/minicpm_gr00t/run_minicpm_gr00t.py \
@@ -32,51 +38,20 @@ from phyai.models.minicpm_gr00t.main_minicpm_gr00t import MiniCPMGR00TArgs
 from phyai.models.minicpm_gr00t.scheduler_ws1_minicpm_gr00t import (
     MiniCPMGR00TRequest,
 )
-
-
-DEFAULT_PROMPT_TEMPLATE = (
-    "The robot is LIBERO Franka, a simulated single-arm Franka manipulator. "
-    "Its action control method is absolute single-arm end-effector pose in the "
-    "unified 80D layout with gripper closed command, and its action FPS is 20 Hz. "
-    "Task: {instruction}"
+from phyai_utils_tools.models.minicpm_gr00t import (
+    MINICPM_GR00T_DEFAULT_PROMPT_TEMPLATE,
+    MiniCPMGR00TProcessor,
 )
 
 
-def load_images(paths: list[Path], size: int) -> list[Image.Image]:
+def load_raw_images(paths: list[Path], size: int) -> list[np.ndarray]:
+    """Return two raw HWC uint8 frames; the processor owns the model resize."""
     if not paths:
         blank = np.zeros((size, size, 3), dtype=np.uint8)
-        return [Image.fromarray(blank), Image.fromarray(blank)]
+        return [blank, blank.copy()]
     if len(paths) != 2:
         raise ValueError(f"Expected exactly two --image paths, got {len(paths)}.")
-    return [Image.open(path).convert("RGB").resize((size, size)) for path in paths]
-
-
-def build_request(
-    processor,
-    *,
-    images: list[Image.Image],
-    prompt: str,
-    seed: int,
-) -> MiniCPMGR00TRequest:
-    content = [{"type": "image", "image": image} for image in images]
-    content.append({"type": "text", "text": prompt})
-    processed = processor.apply_chat_template(
-        [{"role": "user", "content": content}],
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-        processor_kwargs={"padding": False},
-    )
-    generator = torch.Generator().manual_seed(seed)
-    return MiniCPMGR00TRequest(
-        input_ids=processed["input_ids"],
-        attention_mask=processed["attention_mask"],
-        pixel_values=processed["pixel_values"],
-        target_sizes=processed["target_sizes"],
-        state=torch.zeros(1, 1, 80, dtype=torch.float32),
-        noise=torch.randn(1, 30, 80, generator=generator),
-    )
+    return [np.asarray(Image.open(path).convert("RGB")) for path in paths]
 
 
 def main() -> None:
@@ -117,7 +92,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--prompt-template",
-        default=DEFAULT_PROMPT_TEMPLATE,
+        default=MINICPM_GR00T_DEFAULT_PROMPT_TEMPLATE,
         help="Prompt template; must contain an {instruction} placeholder.",
     )
     parser.add_argument(
@@ -134,12 +109,27 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    processor = AutoProcessor.from_pretrained(args.vlm_path)
-    request = build_request(
-        processor,
-        images=load_images(args.image, args.image_size),
-        prompt=args.prompt_template.format(instruction=args.instruction),
-        seed=args.seed,
+    processor = MiniCPMGR00TProcessor(
+        processor=AutoProcessor.from_pretrained(args.vlm_path),
+        processor_name=str(args.vlm_path),
+        image_size=(args.image_size, args.image_size),
+        prompt_template=args.prompt_template,
+    )
+    processed = processor.preprocess(
+        {
+            "images": load_raw_images(args.image, args.image_size),
+            "task": args.instruction,
+            "state": np.zeros(80, dtype=np.float32),
+        }
+    )
+    generator = torch.Generator().manual_seed(args.seed)
+    request = MiniCPMGR00TRequest(
+        input_ids=processed.input_ids,
+        attention_mask=processed.attention_mask,
+        pixel_values=processed.pixel_values,
+        target_sizes=processed.target_sizes,
+        state=processed.state,
+        noise=torch.randn(1, 30, 80, generator=generator),
     )
     engine = Engine(
         EngineArgs(
@@ -154,6 +144,7 @@ def main() -> None:
         elapsed = time.perf_counter() - start
     finally:
         engine.close()
+    actions = processor.postprocess(actions)
 
     print(
         f"actions={tuple(actions.shape)} dtype={actions.dtype} "
